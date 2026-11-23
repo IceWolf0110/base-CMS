@@ -1,10 +1,52 @@
 import { Module } from '@nestjs/common';
-import { AppController } from './app.controller.js';
-import { AppService } from './app.service.js';
+import { UsersModule } from './users/users.module.js';
+import { ConfigModule, ConfigService } from '@nestjs/config';
+import { TypeOrmModule } from '@nestjs/typeorm';
 
 @Module({
-  imports: [],
-  controllers: [AppController],
-  providers: [AppService],
+  imports: [
+    ConfigModule.forRoot({
+      isGlobal: true,
+
+      validate: (config) => {
+        if (
+          config.NODE_ENV !== 'development' &&
+          config.NODE_ENV !== 'production'
+        ) {
+          throw new Error(
+            'NODE_ENV must be either "development" or "production"',
+          );
+        }
+
+        return config;
+      },
+    }),
+
+    TypeOrmModule.forRootAsync({
+      inject: [ConfigService],
+
+      useFactory: (configService: ConfigService) => {
+        const isProduction =
+          configService.get<string>('NODE_ENV') === 'production';
+
+        return {
+          type: 'better-sqlite3' as const,
+
+          database:
+            configService.get<string>('DATABASE_PATH') ??
+            'database/database.sqlite',
+
+          autoLoadEntities: true,
+
+          synchronize: !isProduction,
+          dropSchema: !isProduction,
+        };
+      },
+    }),
+
+    UsersModule,
+  ],
+  controllers: [],
+  providers: [],
 })
 export class AppModule {}
