@@ -1,0 +1,72 @@
+
+portless
+
+  Proxy is running
+  tenma.app (auto-resolves to 127.0.0.1)
+  Using port 4137
+
+  -> https://tenma.app
+
+Running: PORT=4137 HOST=127.0.0.1 PORTLESS_URL=https://tenma.app NODE_EXTRA_CA_CERTS="/var/home/son/.portless/ca.pem" pnpm --dir /var/home/son/Projects/base-CMS/frontend run dev
+
+$ next dev
+▲ Next.js 16.4.5 (Turbopack)
+- Local:         http://localhost:4137
+- Network:       http://192.168.66.149:4137
+✓ Ready in 175ms
+✓ Running next.config.ts took 19ms
+
+[?25h
+
+portless
+
+  Proxy is running
+  tenma.app (auto-resolves to 127.0.0.1)
+  Using port 4648
+
+  -> https://tenma.app
+
+Running: PORT=4648 HOST=127.0.0.1 PORTLESS_URL=https://tenma.app NODE_EXTRA_CA_CERTS="/var/home/son/.portless/ca.pem" pnpm run dev
+
+$ next dev
+▲ Next.js 16.4.5 (Turbopack)
+- Local:         http://localhost:4648
+- Network:       http://192.168.66.149:4648
+✓ Ready in 179ms
+✓ Running next.config.ts took 20ms
+
+[?25h
+
+portless
+
+  Proxy is running
+  tenma.app (auto-resolves to 127.0.0.1)
+  Using port 4035
+
+  -> https://tenma.app
+
+Running: PORT=4035 HOST=127.0.0.1 PORTLESS_URL=https://tenma.app NODE_EXTRA_CA_CERTS="/var/home/son/.portless/ca.pem" pnpm run dev
+
+✓ Lockfile passes supply-chain policies (verified 58m ago)
+Lockfile is up to date, resolution step is skipped
+Packages: +39 -17
++++++++++++++++++++++++++++++++++++++++-----------------
+Progress: resolved 39, reused 23, downloaded 16, added 39, done
+
+dependencies:
+- lucide-react 1.77.0
++ lucide-react 1.76.0
+
+Packages awaiting approval:
+  @tanstack/react-table  skills
+
+Run "pnpm approve" to review the packages awaiting approval.
+Done in 916ms using pnpm v12.23.0
+$ next dev
+▲ Next.js 16.4.5 (Turbopack)
+- Local:         http://localhost:4035
+- Network:       http://192.168.66.149:4035
+✓ Ready in 185ms
+✓ Running next.config.ts took 20ms
+
+[?25h

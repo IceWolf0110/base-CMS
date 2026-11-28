@@ -1,536 +1,440 @@
-
 #!/usr/bin/env bash
-
 set -Eeuo pipefail
 
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-
-# --------------------------------------------------
-# Toolbx
-# --------------------------------------------------
-
-TOOLBOX_CONTAINER="node-env"
-
-if [[ ! -f /run/.toolboxenv ]]; then
-  if ! command -v toolbox >/dev/null 2>&1; then
-    printf '[ERROR] toolbox is not installed.\n' >&2
-    exit 1
-  fi
-
-  printf '[INFO] Entering Toolbx: %s\n' "$TOOLBOX_CONTAINER"
-
-  exec toolbox run \
-    --container "$TOOLBOX_CONTAINER" \
-    "$ROOT_DIR/app.sh" "$@"
-fi
-
-# --------------------------------------------------
-# Configuration
-# --------------------------------------------------
-
 FRONTEND_DIR="$ROOT_DIR/frontend"
 BACKEND_DIR="$ROOT_DIR/backend"
-
 STATE_DIR="$ROOT_DIR/.app"
 PID_DIR="$STATE_DIR/pids"
 LOG_DIR="$STATE_DIR/logs"
 
-PORTLESS_TLD="app"
+# Local URLs:
+# Frontend: https://tenma.app
+# Backend:  https://api.tenma.app
+export PORTLESS_TLD=app
+
 PORTLESS_STATE_DIR="${PORTLESS_STATE_DIR:-$HOME/.portless}"
-
-PROXY_PID_FILE="$PORTLESS_STATE_DIR/proxy.pid"
-PROXY_OWNED_FILE="$STATE_DIR/portless-proxy.pid"
-
-FRONTEND_URL="https://tenma.app"
-BACKEND_URL="https://api.tenma.app"
-
-PORTLESS_BIN=""
-
-APP_PIDS=()
-APP_NAMES=()
-TAIL_PID=""
-
-export PORTLESS_TLD
 export PORTLESS_STATE_DIR
 
-# --------------------------------------------------
-# Helpers
-# --------------------------------------------------
+PORTLESS_BIN=""
+PROXY_PID_FILE="$PORTLESS_STATE_DIR/proxy.pid"
 
-info() {
-  printf '\033[1;34m[INFO]\033[0m %s\n' "$1"
-}
-
-success() {
-  printf '\033[1;32m[ OK ]\033[0m %s\n' "$1"
-}
-
-error() {
-  printf '\033[1;31m[ERROR]\033[0m %s\n' "$1" >&2
-}
+mkdir -p "$PID_DIR" "$LOG_DIR"
 
 require_command() {
-  if ! command -v "$1" >/dev/null 2>&1; then
-    error "Required command not found: $1"
+  command -v "$1" >/dev/null 2>&1 || {
+    echo "Error: '$1' is required but was not found in PATH." >&2
     exit 1
-  fi
-}
-
-ensure_node_command() {
-  if command -v node >/dev/null 2>&1; then
-    return
-  fi
-
-  local node_bin
-
-  node_bin="$(command -v node-26 || true)"
-
-  if [[ -n "$node_bin" ]]; then
-    mkdir -p "$HOME/.local/bin"
-
-    ln -sfn "$node_bin" "$HOME/.local/bin/node"
-
-    export PATH="$HOME/.local/bin:$PATH"
-
-    info "Created node symlink: $node_bin"
-    return
-  fi
-
-  error "Node.js is not installed."
-  exit 1
-}
-
-check_environment() {
-  ensure_node_command
-
-  require_command node
-  require_command pnpm
-  require_command tail
-
-  PORTLESS_BIN="$(command -v portless || true)"
-
-  if [[ -z "$PORTLESS_BIN" ]]; then
-    error "Portless is not installed."
-    exit 1
-  fi
+  }
 }
 
 check_projects() {
-  for dir in "$FRONTEND_DIR" "$BACKEND_DIR"; do
-    if [[ ! -f "$dir/package.json" ]]; then
-      error "Missing package.json: $dir"
-      exit 1
+  [[ -d "$FRONTEND_DIR" ]] || {
+    echo "Error: missing directory: $FRONTEND_DIR" >&2
+    exit 1
+  }
+
+  [[ -d "$BACKEND_DIR" ]] || {
+    echo "Error: missing directory: $BACKEND_DIR" >&2
+    exit 1
+  }
+}
+
+get_portless_proxy_pid() {
+  local pid
+  local command_line
+
+  [[ -r "$PROXY_PID_FILE" ]] || return 1
+
+  IFS= read -r pid < "$PROXY_PID_FILE" || return 1
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+
+  command_line="$(ps -p "$pid" -o args= 2>/dev/null || true)"
+  [[ "$command_line" == *portless* ]] || return 1
+
+  printf '%s\n' "$pid"
+}
+
+group_is_running() {
+  local pgid="$1"
+
+  [[ "$pgid" =~ ^[0-9]+$ ]] &&
+    kill -0 -- "-$pgid" 2>/dev/null
+}
+
+# Start Portless with HTTPS and the .app TLD.
+start_portless_proxy_command() {
+  sudo env \
+    PATH="$PATH" \
+    PORTLESS_STATE_DIR="$PORTLESS_STATE_DIR" \
+    PORTLESS_TLD=app \
+    "$PORTLESS_BIN" proxy start --https --tld app
+}
+
+# Stop the proxy regardless of which state directory started it.
+# Output is captured to avoid duplicate "Proxy is not running." messages.
+stop_portless_proxy_command() {
+  local output=""
+  local command_status=0
+
+  require_command sudo
+
+  # First try the root-managed default state directory.
+  if output="$(sudo env \
+    -u PORTLESS_STATE_DIR \
+    PATH="$PATH" \
+    PORTLESS_TLD=app \
+    "$PORTLESS_BIN" proxy stop 2>&1)"; then
+    command_status=0
+  else
+    command_status=$?
+  fi
+
+  if [[ "$output" == *"Proxy stopped."* ]]; then
+    echo "Proxy stopped."
+    return 0
+  fi
+
+  # Only continue when the root-managed proxy is not running.
+  if [[ "$output" != *"Proxy is not running."* ]]; then
+    if [[ -n "$output" ]]; then
+      printf '%s\n' "$output" >&2
     fi
-  done
+    return "$command_status"
+  fi
+
+  # Next try the configured user's Portless state directory.
+  if output="$(sudo env \
+    PATH="$PATH" \
+    PORTLESS_STATE_DIR="$PORTLESS_STATE_DIR" \
+    PORTLESS_TLD=app \
+    "$PORTLESS_BIN" proxy stop 2>&1)"; then
+    command_status=0
+  else
+    command_status=$?
+  fi
+
+  if [[ "$output" == *"Proxy stopped."* ]]; then
+    echo "Proxy stopped."
+    return 0
+  fi
+
+  if [[ "$output" == *"Proxy is not running."* ]]; then
+    echo "Portless proxy is already stopped."
+    return 0
+  fi
+
+  # Handle unexpected output or an actual command failure.
+  if [[ -n "$output" ]]; then
+    printf '%s\n' "$output" >&2
+  fi
+
+  return "$command_status"
 }
-
-create_directories() {
-  mkdir -p "$PID_DIR" "$LOG_DIR" "$PORTLESS_STATE_DIR"
-
-  touch "$LOG_DIR/frontend.log"
-  touch "$LOG_DIR/backend.log"
-}
-
-# --------------------------------------------------
-# Environment setup
-# --------------------------------------------------
-
-setup_env() {
-  info "Setting up environment inside node-env..."
-
-  check_environment
-  check_projects
-  create_directories
-
-  info "Installing frontend dependencies..."
-
-  (
-    cd "$FRONTEND_DIR"
-    pnpm install
-  )
-
-  info "Installing backend dependencies..."
-
-  (
-    cd "$BACKEND_DIR"
-    pnpm install
-  )
-
-  info "Trusting Portless HTTPS certificate..."
-
-  "$PORTLESS_BIN" trust
-
-  success "Environment setup completed."
-}
-
-# --------------------------------------------------
-# Portless
-# --------------------------------------------------
 
 start_portless_proxy() {
-  local existing_pid=""
-
-  if [[ -f "$PROXY_PID_FILE" ]]; then
-    existing_pid="$(<"$PROXY_PID_FILE")"
-
-    if [[ "$existing_pid" =~ ^[0-9]+$ ]] &&
-       kill -0 "$existing_pid" 2>/dev/null; then
-
-      info "Restarting existing Portless proxy..."
-
-      "$PORTLESS_BIN" proxy stop >/dev/null 2>&1 || true
-
-      for _ in {1..30}; do
-        if ! kill -0 "$existing_pid" 2>/dev/null; then
-          break
-        fi
-
-        sleep 0.1
-      done
-    fi
-  fi
-
-  info "Starting Portless proxy with .$PORTLESS_TLD..."
-
-  "$PORTLESS_BIN" proxy start --https --tld "$PORTLESS_TLD"
-
-  local new_pid=""
-
-  for _ in {1..30}; do
-    if [[ -f "$PROXY_PID_FILE" ]]; then
-      new_pid="$(<"$PROXY_PID_FILE")"
-
-      if [[ "$new_pid" =~ ^[0-9]+$ ]] &&
-         kill -0 "$new_pid" 2>/dev/null; then
-
-        printf '%s\n' "$new_pid" > "$PROXY_OWNED_FILE"
-
-        success "Portless proxy started."
-        return 0
-      fi
-    fi
-
-    sleep 0.1
-  done
-
-  error "Could not verify Portless proxy startup."
-  return 1
-}
-
-stop_owned_proxy() {
-  [[ -f "$PROXY_OWNED_FILE" ]] || return 0
-
-  local owned_pid
+  local previous_pid=""
   local current_pid=""
+  local output=""
+  local status=0
 
-  owned_pid="$(<"$PROXY_OWNED_FILE")"
-
-  if [[ -f "$PROXY_PID_FILE" ]]; then
-    current_pid="$(<"$PROXY_PID_FILE")"
+  if previous_pid="$(get_portless_proxy_pid)"; then
+    echo "Detected an existing Portless proxy (PID: $previous_pid)."
+  else
+    echo "No Portless proxy detected in the configured state directory."
   fi
 
-  if [[ "$owned_pid" == "$current_pid" ]] &&
-     [[ "$owned_pid" =~ ^[0-9]+$ ]] &&
-     kill -0 "$owned_pid" 2>/dev/null; then
+  echo "Starting Portless proxy with HTTPS and TLD .app..."
 
-    info "Stopping Portless proxy..."
+  if output="$(start_portless_proxy_command 2>&1)"; then
+    [[ -z "$output" ]] || printf '%s\n' "$output"
+  else
+    status=$?
 
-    "$PORTLESS_BIN" proxy stop >/dev/null 2>&1 || true
-  fi
+    # Detect an existing proxy with a conflicting configuration.
+    if [[ "$output" == *"different config"* ]] ||
+       [[ "$output" == *"running proxy is using"* ]]; then
 
-  rm -f "$PROXY_OWNED_FILE"
-}
+      printf '%s\n' "$output"
+      echo
+      echo "The existing Portless proxy has a different configuration."
+      echo "Stopping it and restarting with TLD .app..."
 
-# --------------------------------------------------
-# Applications
-# --------------------------------------------------
-
-build_projects() {
-  info "Building frontend..."
-
-  (
-    cd "$FRONTEND_DIR"
-    pnpm run build
-  )
-
-  success "Frontend build completed."
-
-  info "Building backend..."
-
-  (
-    cd "$BACKEND_DIR"
-    pnpm run build
-  )
-
-  success "Backend build completed."
-}
-
-start_service() {
-  local label="$1"
-  local app_name="$2"
-  local app_dir="$3"
-  local script="$4"
-  local log_file="$5"
-
-  info "Starting $label..."
-
-  (
-    cd "$app_dir"
-
-    exec "$PORTLESS_BIN" "$app_name" pnpm run "$script"
-  ) >> "$log_file" 2>&1 &
-
-  local pid=$!
-
-  APP_PIDS+=("$pid")
-  APP_NAMES+=("$label")
-
-  printf '%s\n' "$pid" > "$PID_DIR/$label.pid"
-
-  success "$label started (PID: $pid)."
-}
-
-start_applications() {
-  local mode="$1"
-
-  local frontend_script
-  local backend_script
-
-  case "$mode" in
-    dev)
-      frontend_script="dev"
-      backend_script="start:dev"
-      ;;
-    prod)
-      frontend_script="start"
-      backend_script="start:prod"
-      ;;
-    *)
-      error "Unknown mode: $mode"
-      exit 1
-      ;;
-  esac
-
-  check_environment
-  check_projects
-  create_directories
-
-  if [[ "$mode" == "prod" ]]; then
-    build_projects
-  fi
-
-  start_portless_proxy
-
-  tail -n 0 -F \
-    "$LOG_DIR/frontend.log" \
-    "$LOG_DIR/backend.log" &
-
-  TAIL_PID=$!
-
-  start_service \
-    "frontend" \
-    "tenma" \
-    "$FRONTEND_DIR" \
-    "$frontend_script" \
-    "$LOG_DIR/frontend.log"
-
-  start_service \
-    "backend" \
-    "api.tenma" \
-    "$BACKEND_DIR" \
-    "$backend_script" \
-    "$LOG_DIR/backend.log"
-
-  printf '\n'
-
-  success "Tenma is running in $mode mode."
-
-  printf '\n'
-  printf 'Frontend: %s\n' "$FRONTEND_URL"
-  printf 'Backend:  %s\n' "$BACKEND_URL"
-
-  printf '\n'
-
-  info "Press any key to stop all applications..."
-
-  monitor_applications
-}
-
-# --------------------------------------------------
-# Cleanup
-# --------------------------------------------------
-
-stop_tail() {
-  if [[ -n "$TAIL_PID" ]]; then
-    kill "$TAIL_PID" 2>/dev/null || true
-    wait "$TAIL_PID" 2>/dev/null || true
-
-    TAIL_PID=""
-  fi
-}
-
-stop_applications() {
-  local pid
-  local any_alive
-
-  if [[ ${#APP_PIDS[@]} -eq 0 ]]; then
-    return
-  fi
-
-  info "Stopping applications..."
-
-  for pid in "${APP_PIDS[@]}"; do
-    if [[ "$pid" =~ ^[0-9]+$ ]]; then
-      kill -INT "$pid" 2>/dev/null || true
-    fi
-  done
-
-  for ((attempt = 0; attempt < 50; attempt++)); do
-    any_alive=0
-
-    for pid in "${APP_PIDS[@]}"; do
-      if [[ "$pid" =~ ^[0-9]+$ ]] &&
-         kill -0 "$pid" 2>/dev/null; then
-        any_alive=1
+      if ! stop_portless_proxy_command; then
+        echo "Error: could not stop the existing Portless proxy." >&2
+        return 1
       fi
+
+      echo
+      echo "Starting Portless proxy with HTTPS and TLD .app..."
+
+      if output="$(start_portless_proxy_command 2>&1)"; then
+        [[ -z "$output" ]] || printf '%s\n' "$output"
+      else
+        status=$?
+        printf '%s\n' "$output" >&2
+        echo "Error: could not restart Portless proxy." >&2
+        return "$status"
+      fi
+    else
+      printf '%s\n' "$output" >&2
+      return "$status"
+    fi
+  fi
+
+  if current_pid="$(get_portless_proxy_pid)"; then
+    echo "Portless proxy is running (PID: $current_pid)."
+  else
+    echo "Portless started, but its PID could not be verified."
+  fi
+}
+
+# Always stop the proxy, even if app.sh did not start it.
+stop_portless_proxy() {
+  echo "Stopping Portless proxy..."
+
+  if stop_portless_proxy_command; then
+    rm -f "$PROXY_PID_FILE"
+  else
+    echo "Error: failed to stop Portless proxy." >&2
+    return 1
+  fi
+}
+
+stop_one() {
+  local name="$1"
+  local pid_file="$PID_DIR/$name.pid"
+  local pgid
+
+  if [[ ! -f "$pid_file" ]]; then
+    echo "$name: not running (no PID file)."
+    return 0
+  fi
+
+  pgid="$(<"$pid_file")"
+
+  if group_is_running "$pgid"; then
+    echo "Stopping $name (process group $pgid)..."
+
+    kill -TERM -- "-$pgid" 2>/dev/null || true
+
+    for _ in {1..50}; do
+      group_is_running "$pgid" || break
+      sleep 0.1
     done
 
-    if (( any_alive == 0 )); then
-      break
+    if group_is_running "$pgid"; then
+      echo "$name did not exit; sending SIGKILL..."
+      kill -KILL -- "-$pgid" 2>/dev/null || true
+    fi
+  else
+    echo "$name: process group is already stopped."
+  fi
+
+  rm -f "$pid_file"
+}
+
+stop_all() {
+  local failed=0
+
+  stop_one frontend || failed=1
+  stop_one backend || failed=1
+  stop_portless_proxy || failed=1
+
+  echo
+
+  if (( failed == 0 )); then
+    echo "Tenma processes stopped."
+  else
+    echo "Some processes could not be stopped." >&2
+  fi
+
+  return "$failed"
+}
+
+start_one() {
+  local service_name="$1"
+  local project_dir="$2"
+  local portless_name="$3"
+  local pnpm_script="$4"
+
+  local pid_file="$PID_DIR/$service_name.pid"
+  local log_file="$LOG_DIR/$service_name.log"
+  local pid
+
+  if [[ -f "$pid_file" ]]; then
+    pid="$(<"$pid_file")"
+
+    if group_is_running "$pid"; then
+      echo "Error: $service_name is already running (process group $pid)." >&2
+      return 1
     fi
 
-    sleep 0.1
-  done
+    rm -f "$pid_file"
+  fi
 
-  for pid in "${APP_PIDS[@]}"; do
-    if [[ "$pid" =~ ^[0-9]+$ ]] &&
-       kill -0 "$pid" 2>/dev/null; then
-      kill -TERM "$pid" 2>/dev/null || true
-    fi
-  done
+  echo "Starting $service_name at https://$portless_name.app..."
+
+  (
+    cd "$project_dir"
+    exec setsid "$PORTLESS_BIN" "$portless_name" pnpm run "$pnpm_script"
+  ) >>"$log_file" 2>&1 </dev/null &
+
+  pid=$!
+  printf '%s\n' "$pid" > "$pid_file"
 
   sleep 1
 
-  for pid in "${APP_PIDS[@]}"; do
-    if [[ "$pid" =~ ^[0-9]+$ ]] &&
-       kill -0 "$pid" 2>/dev/null; then
-      kill -KILL "$pid" 2>/dev/null || true
-    fi
+  if ! group_is_running "$pid"; then
+    rm -f "$pid_file"
 
-    wait "$pid" 2>/dev/null || true
-  done
+    echo "Error: $service_name failed to start. Recent log output:" >&2
+    tail -n 40 "$log_file" >&2 || true
 
-  APP_PIDS=()
-  APP_NAMES=()
-
-  rm -f "$PID_DIR"/*.pid
+    return 1
+  fi
 }
 
-cleanup() {
-  local status=$?
-
-  trap - EXIT INT TERM
-
-  stop_tail
-  stop_applications
-  stop_owned_proxy
-
-  exit "$status"
-}
-
-# --------------------------------------------------
-# Monitor
-# --------------------------------------------------
-
-monitor_applications() {
-  local index
+check_not_already_running() {
+  local name
+  local pid_file
   local pid
-  local status
 
-  while true; do
-    if IFS= read -r -s -n 1 -t 0.2 _; then
-      printf '\n'
-      info "Stop requested."
-      return 0
-    fi
+  for name in frontend backend; do
+    pid_file="$PID_DIR/$name.pid"
 
-    for index in "${!APP_PIDS[@]}"; do
-      pid="${APP_PIDS[$index]}"
+    if [[ -f "$pid_file" ]]; then
+      pid="$(<"$pid_file")"
 
-      [[ -n "$pid" ]] || continue
-
-      if ! kill -0 "$pid" 2>/dev/null; then
-        if wait "$pid"; then
-          status=0
-          info "${APP_NAMES[$index]} exited."
-        else
-          status=$?
-          error "${APP_NAMES[$index]} exited with status $status."
-        fi
-
-        APP_PIDS[$index]=""
-
-        return "$status"
+      if group_is_running "$pid"; then
+        echo "Error: $name is already running (process group $pid)." >&2
+        echo "Run '$0 stop' first." >&2
+        exit 1
       fi
-    done
+
+      rm -f "$pid_file"
+    fi
   done
 }
 
-# --------------------------------------------------
-# Main
-# --------------------------------------------------
+build_projects() {
+  echo
+  echo "================================"
+  echo " Building Tenma"
+  echo "================================"
 
-usage() {
-  cat <<EOF
-Usage:
+  echo
+  echo "[1/2] Building frontend..."
+  (
+    cd "$FRONTEND_DIR"
+    pnpm run build
+  )
 
-  ./app.sh start dev
-  ./app.sh start prod
-  ./app.sh set up env
+  echo
+  echo "[2/2] Building backend..."
+  (
+    cd "$BACKEND_DIR"
+    pnpm run build
+  )
 
-Press any key while running to stop all applications.
-EOF
+  echo
+  echo "Both projects built successfully."
 }
 
-trap cleanup EXIT
-trap 'exit 130' INT
-trap 'exit 143' TERM
+start_all() {
+  local mode="$1"
+  local frontend_script
+  local backend_script
+
+  check_projects
+
+  require_command pnpm
+  require_command portless
+  require_command setsid
+  require_command ps
+  require_command sudo
+
+  PORTLESS_BIN="$(command -v portless)"
+
+  check_not_already_running
+
+  case "$mode" in
+    dev)
+      frontend_script=dev
+      backend_script=start:dev
+      ;;
+
+    prod)
+      frontend_script=start
+      backend_script=start:prod
+
+      # Build both projects before starting either application.
+      build_projects
+      ;;
+
+    *)
+      echo "Usage: $0 start {dev|prod} | stop" >&2
+      exit 2
+      ;;
+  esac
+
+  start_portless_proxy
+
+  if ! start_one frontend "$FRONTEND_DIR" tenma "$frontend_script"; then
+    stop_all || true
+    return 1
+  fi
+
+  if ! start_one backend "$BACKEND_DIR" api.tenma "$backend_script"; then
+    stop_all || true
+    return 1
+  fi
+
+  echo
+  echo "================================"
+  echo " Tenma is running ($mode)"
+  echo "================================"
+  echo
+  echo "Frontend: https://tenma.app"
+  echo "Backend:  https://api.tenma.app"
+  echo
+  echo "Logs:"
+  echo "  Frontend: $LOG_DIR/frontend.log"
+  echo "  Backend:  $LOG_DIR/backend.log"
+  echo
+  echo "Stop everything with: $0 stop"
+}
 
 case "${1:-}" in
   start)
-    if [[ "$#" -ne 2 ]]; then
-      usage
-      exit 1
+    if [[ $# -ne 2 ]]; then
+      echo "Usage: $0 start {dev|prod}" >&2
+      exit 2
     fi
 
-    if [[ ! -t 0 ]]; then
-      error "Start this script from an interactive terminal."
-      exit 1
-    fi
-
-    case "$2" in
-      dev|prod)
-        start_applications "$2"
-        ;;
-      *)
-        error "Unknown mode: $2"
-        usage
-        exit 1
-        ;;
-    esac
+    start_all "$2"
     ;;
 
-  set)
-    if [[ "${2:-}" == "up" && "${3:-}" == "env" && "$#" -eq 3 ]]; then
-      setup_env
-    else
-      usage
-      exit 1
+  stop)
+    if [[ $# -ne 1 ]]; then
+      echo "Usage: $0 stop" >&2
+      exit 2
     fi
+
+    require_command portless
+    require_command sudo
+
+    PORTLESS_BIN="$(command -v portless)"
+
+    stop_all
     ;;
 
   *)
-    usage
-    exit 1
+    echo "Usage:"
+    echo "  $0 start dev"
+    echo "  $0 start prod"
+    echo "  $0 stop"
+    exit 2
     ;;
 esac

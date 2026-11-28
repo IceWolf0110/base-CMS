@@ -6,8 +6,10 @@ import {
 import { UserDto, UserResponseDto } from './dto/user.dto.js';
 import { InjectRepository } from '@nestjs/typeorm';
 import { User } from './entities/user.entity.js';
+import { AuthSession } from '../auth/entities/auth-session.entity.js';
 import { Not, Repository, QueryFailedError } from 'typeorm';
 import { UserRole } from './entities/user.entity.js';
+import type { AuthUser } from '../auth/auth.types.js';
 import * as argon2 from 'argon2';
 
 @Injectable()
@@ -15,6 +17,9 @@ export class UsersService {
   constructor(
     @InjectRepository(User)
     private readonly userRepository: Repository<User>,
+
+    @InjectRepository(AuthSession)
+    private readonly authSessionRepository: Repository<AuthSession>,
   ) {}
 
   async create(createUserDto: UserDto): Promise<UserResponseDto> {
@@ -70,6 +75,7 @@ export class UsersService {
 
   async update(id: number, updateUserDto: UserDto): Promise<UserResponseDto> {
     const user = await this.findOne(id);
+    let passwordChanged = false;
 
     if (updateUserDto.name !== undefined) {
       user.name = updateUserDto.name;
@@ -96,10 +102,16 @@ export class UsersService {
       user.password = await argon2.hash(updateUserDto.password, {
         type: argon2.argon2id,
       });
+      passwordChanged = true;
     }
 
     try {
       const updatedUser = await this.userRepository.save(user);
+
+      if (passwordChanged) {
+        // force re-login on every device
+        await this.authSessionRepository.delete({ userId: id });
+      }
 
       return new UserResponseDto(updatedUser);
     } catch (error) {
@@ -125,5 +137,20 @@ export class UsersService {
     return {
       message: 'User deleted successfully',
     };
+  }
+
+  async me(user: AuthUser): Promise<UserResponseDto> {
+    return new UserResponseDto(await this.findOne(user.id));
+  }
+
+  async findUserPasswordByEmail(email: string): Promise<User | null> {
+    return this.userRepository.findOne({
+      where: {
+        email: email.trim().toLowerCase(),
+      },
+      select: {
+        password: true,
+      },
+    });
   }
 }

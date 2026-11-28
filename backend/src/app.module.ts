@@ -2,6 +2,8 @@ import { Module } from '@nestjs/common';
 import { UsersModule } from './users/users.module.js';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import { TypeOrmModule } from '@nestjs/typeorm';
+import { AuthModule } from './auth/auth.module.js';
+import { JwtTokenModule } from './jwt-token/jwt-token.module.js';
 
 @Module({
   imports: [
@@ -9,6 +11,8 @@ import { TypeOrmModule } from '@nestjs/typeorm';
       isGlobal: true,
 
       validate: (config) => {
+        console.log(config.NODE_ENV)
+        
         if (
           config.NODE_ENV !== 'development' &&
           config.NODE_ENV !== 'production'
@@ -37,7 +41,6 @@ import { TypeOrmModule } from '@nestjs/typeorm';
             'database/database.sqlite',
 
           autoLoadEntities: true,
-
           synchronize: !isProduction,
           dropSchema: !isProduction,
         };
@@ -45,6 +48,7 @@ import { TypeOrmModule } from '@nestjs/typeorm';
     }),
 
     UsersModule,
+    AuthModule,
   ],
   controllers: [],
   providers: [],
